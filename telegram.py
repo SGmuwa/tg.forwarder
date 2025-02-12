@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
 
-from asyncio import sleep
 from telethon import TelegramClient, events
 import telethon
+import telethon.requestiter
 from telethon.sessions import StringSession
-from datetime import datetime, timedelta
 from loguru import logger
 from os import environ, remove
 import re
 from json5 import load, loads
 
 logger.trace("application started.")
-
-NEED_TO_WAIT_S = int(environ.get("NEED_TO_WAIT_S", "5400"))
 
 class Settings:
     def __init__(
@@ -31,7 +28,6 @@ class Settings:
                 remove(secret_path)
             except Exception as e:
                 logger.warning("Can't remove secret file, error: «{}»", e)
-        self._bot_user_id = re.sub(r":.*", "", self.json["bot_token"])
         self._is_session_and_auth_key_configurated = None
 
     @property
@@ -66,15 +62,19 @@ class Settings:
     @property
     def target_chat(self) -> int:
         return self.json["target_chat"]
-    
+
     @property
-    def bot_user_id(self):
-        return self._bot_user_id
+    def source_chat(self) -> int:
+        return self.json["source_chat"]
+
+    @property
+    def search_only_regex(self) -> int:
+        return self.json["search_only_regex"]
 
 
 settings = Settings()
 
-lastSend = None
+searcher_targets = re.compile(settings.search_only_regex)
 
 logger.trace("Init TelegramClient...")
 with TelegramClient(
@@ -82,23 +82,15 @@ with TelegramClient(
     settings.api_id,
     settings.api_hash,
     base_logger=logger
-).start(bot_token=settings.bot_token) as client:
+).start() as client:
     client: TelegramClient = client
     logger.trace("Telegram client instance created")
     if not settings.is_session_and_auth_key_configurated:
         raise Exception(f"Use session, instead of api_id and api_hash. Set session_and_auth_key to value: «{client.session.save()}»")
 
-    username = ""
-
-    async def get_username():
-        global username
-        if not username:
-            username = (await client.get_me()).username
-        return username
-
     def split_str_by_length(s: str, chunk_limit: int):
         return [s[i:i+chunk_limit] for i in range(0, len(s), chunk_limit)]
-
+    
     async def send_to_future(peer_id, msg, **kwargs) -> list[telethon.types.Message]:
         logger.trace("send_to_future: begin")
         logger.trace("Ready to send {} KiB", len(msg) / 1024)
@@ -120,72 +112,19 @@ with TelegramClient(
             return f"https://t.me/{chat.username}/{message.id}"
         else:
             return f"https://t.me/c/{chat.id}/{message.id}"
-        
-    async def buildAlertCallText(event: telethon.events.newmessage.NewMessage.Event):
-        message: telethon.tl.patched.Message = event.message
-        callText = re.sub(rf"^/alert@{await get_username()}\s*", "", message.text)
-        link = await getLinkOfMessage(message)
-        sender: telethon.types.User = await message.get_sender()
-        logger.trace("sender: {sender}", sender=sender)
-        output = f"На кухню зовёт "
-        if sender.username and sender.first_name:
-            output += f"{sender.first_name} @{(sender.username)}"
-        elif sender.username:
-            output += f"@{sender.username}"
-        elif sender.first_name:
-            output += sender.first_name
-        else:
-            output += f"аноним с id={sender.id}"
-        output += f" в чате {link}"
-        if callText:
-            output += f": «{callText}»"
-        return output
     
     async def alert(event: telethon.events.newmessage.NewMessage.Event):
-        global lastSend
         message: telethon.tl.patched.Message = event.message
-        to_delete = []
-        if message.sender_id == settings.bot_user_id:
-            logger.warning(f"Sender is bot! Skip: {message.text}")
+        if (await client.get_me()).id == message.sender_id:
+            logger.warning(f"Sender is me! Skip: {message.text}")
             return
-        elif not message.text.startswith(f"/alert@{await get_username()}"):
-            logger.debug(f"Только команда «/alert@{await get_username()}» поддерживается из бесед. {event}", event=event)
-        elif not message.text.startswith(f"/alert@{await get_username()} "):
-            logger.warning("Для вызова всех на кухню необходимо написать команду-приглашение, пробел, пригласительный текст. {event}", event=event)
-            to_delete = await send_to_future(
-                message.peer_id,
-                f"❌ Для вызова всех на кухню необходимо написать:\n\n1. Команду-приглашение\n2. Пробел\n3. Пригласительный текст\n\nПример:\n\n`/alert@{await get_username()} Приходите на кухню есть пиццу 🍕 в честь моего Дня Рождения! 🎂🥳🎉`\n\nКоманды-приглашения без пригласительного текста отключены.",
-                reply_to=event.message,
-                link_preview=False
-            )
-        elif lastSend is not None and datetime.now() < lastSend + timedelta(seconds=NEED_TO_WAIT_S):
-            logger.warning("Слишком частые оповещения {event}", event=event)
-            to_delete = await send_to_future(
-                message.peer_id,
-                f"⏳ Слишком частые оповещения, нужно подождать {lastSend + timedelta(seconds=NEED_TO_WAIT_S) - datetime.now()}",
-                reply_to=event.message,
-                link_preview=False
-            )
+        matcher = searcher_targets.search(message.text)
+        if matcher == None:
+            logger.debug("no target message {}", message)
         else:
-            lastSend = datetime.now()
-            sendent = await send_to_future(
-                telethon.types.PeerChannel(settings.target_chat),
-                await buildAlertCallText(event),
-                link_preview=False
-            )
-            if sendent:
-                link = await getLinkOfMessage(sendent[0])
-                await send_to_future(
-                    message.peer_id,
-                    f"✅ Зов создан: {link}",
-                    reply_to=event.message,
-                    link_preview=False
-                )
-        if to_delete:
-            await sleep(60)
-            await client.delete_messages(entity=event.chat_id, message_ids=to_delete)
+            await client.forward_messages(settings.target_chat, message)
 
-    @client.on(events.NewMessage())
+    @client.on(events.NewMessage(chats=settings.source_chat))
     async def handler(event: telethon.events.newmessage.NewMessage.Event):
         try:
             message: telethon.tl.patched.Message = event.message
@@ -193,11 +132,5 @@ with TelegramClient(
             await alert(event)
         except Exception as e:
             logger.exception(e)
-            await send_to_future(
-                message.peer_id,
-                str(e),
-                reply_to=event.message,
-                link_preview=False
-            )
     logger.info("Telegram ready")
     client.run_until_disconnected()
