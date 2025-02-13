@@ -122,7 +122,14 @@ with TelegramClient(
         if matcher == None:
             logger.debug("no target message {}", message)
         else:
-            await client.forward_messages(settings.target_chat, message)
+            try:
+                await client.forward_messages(settings.target_chat, message)
+            except ValueError as e:
+                if "Could not find the input entity for" in e.args[0]:
+                    await client.get_dialogs()
+                    await client.forward_messages(settings.target_chat, message)
+                else:
+                    raise
 
     @client.on(events.NewMessage(chats=settings.source_chat))
     async def handler(event: telethon.events.newmessage.NewMessage.Event):
