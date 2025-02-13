@@ -116,9 +116,9 @@ with TelegramClient(
     async def alert(event: telethon.events.newmessage.NewMessage.Event):
         message: telethon.tl.patched.Message = event.message
         if (await client.get_me()).id == message.sender_id:
-            logger.warning(f"Sender is me! Skip: {message.text}")
+            logger.warning(f"Sender is me! Skip: {message.message}")
             return
-        matcher = searcher_targets.search(message.text)
+        matcher = searcher_targets.search(message.message)
         if matcher == None:
             logger.debug("no target message {}", message)
         else:
