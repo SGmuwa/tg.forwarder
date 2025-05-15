@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 
-from telethon import TelegramClient, events
-import telethon
-import telethon.requestiter
-from telethon.sessions import StringSession
+from asyncio import sleep as sleep
+from json5 import load, loads
 from loguru import logger
 from os import environ, remove
+from telethon import TelegramClient, events
+from telethon.functions import messages as fun_messages
+from telethon.sessions import StringSession
 import re
-from json5 import load, loads
+import telethon
 
 logger.trace("application started.")
 
@@ -71,6 +72,14 @@ class Settings:
     def search_only_regex(self) -> int:
         return self.json["search_only_regex"]
 
+    @property
+    def retries_max_count(self) -> int:
+        return self.json.pop("retries_max_count", 3)
+
+    @property
+    def retries_sleep_seconds(self) -> int | float:
+        return self.json.pop("retries_sleep_seconds", 60*20)
+
 
 settings = Settings()
 
@@ -113,23 +122,56 @@ with TelegramClient(
         else:
             return f"https://t.me/c/{chat.id}/{message.id}"
     
+    def retries(callback, max_count = settings.retries_max_count, sleep_seconds = settings.retries_sleep_seconds):
+        async def wrapper(*args, **kwargs):
+            tries = 0
+            while True:
+                tries += 1
+                try:
+                    return await callback(*args, **kwargs)
+                except Exception as e:
+                    if tries >= max_count:
+                        raise Exception("Max retries exceeded", tries, max_count) from e
+                    await sleep(sleep_seconds)
+        return wrapper
+
+    async def forward_message(message: telethon.tl.patched.Message):
+        logger.debug("forward_message start: {}", message)
+        try:
+            result = await client.forward_messages(settings.target_chat, message)
+        except ValueError as e:
+            if "Could not find the input entity for" in e.args[0]:
+                await client.get_dialogs()
+                result = await client.forward_messages(settings.target_chat, message)
+            else:
+                raise
+        logger.debug("forward_message end, return: {}", result)
+        return result
+
+    forward_message_retry = retries(forward_message)
+
+    async def unread_target_chat():
+        logger.debug("unread_target_chat start")
+        result = await client(fun_messages.MarkDialogUnreadRequest(
+            peer=settings.target_chat,
+            unread=True
+        ))
+        logger.debug("unread_target_chat end, return: {}", result)
+        return result
+
+    unread_target_chat_retry = retries(unread_target_chat, 2, 300)
+
     async def alert(event: telethon.events.newmessage.NewMessage.Event):
         message: telethon.tl.patched.Message = event.message
         if (await client.get_me()).id == message.sender_id:
-            logger.warning(f"Sender is me! Skip: {message.message}")
+            logger.warning("Sender is me! Skip: {}", message.message)
             return
         matcher = searcher_targets.search(message.message)
         if matcher == None:
             logger.debug("no target message {}", message)
         else:
-            try:
-                await client.forward_messages(settings.target_chat, message)
-            except ValueError as e:
-                if "Could not find the input entity for" in e.args[0]:
-                    await client.get_dialogs()
-                    await client.forward_messages(settings.target_chat, message)
-                else:
-                    raise
+            await forward_message_retry(message)
+            await unread_target_chat_retry()
 
     @client.on(events.NewMessage(chats=settings.source_chat))
     async def handler(event: telethon.events.newmessage.NewMessage.Event):
